@@ -2,7 +2,7 @@ import os
 import asyncio
 import logging
 import threading
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from flask import Flask
 from telegram import (
@@ -13,228 +13,251 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
 )
 
-# ----------------- ЛОГИ -----------------
+# ---------- ЛОГИ ----------
 logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s: %(message)s",
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("timer-bot")
 
-# ----------------- FLASK HEALTHCHECK -----------------
-# НУЖНО для Render: Gunicorn поднимет этот app, чтобы был открытый порт
+# ---------- НАСТРОЙКИ ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # в Replit добавим в Secrets
+if not BOT_TOKEN:
+    raise RuntimeError(
+        "Переменная окружения BOT_TOKEN не задана. "
+        "Задай её в Replit ➜ Secrets (ключ BOT_TOKEN)."
+    )
+
+# Таймеры по чатам: chat_id -> dict(...)
+RUNNING = {}  # { chat_id: {"owner_id": int, "owner_name": str, "until": datetime, "msg_id": int, "pin_id": int} }
+
+# ---------- KEEP-ALIVE ДЛЯ REPLIT ----------
+# Replit может засыпать. Этот микросервер можно будить пингами (например, UptimeRobot).
 app = Flask(__name__)
 
 @app.get("/")
 def health():
-    return "OK"
+    return "ok"
 
-# ----------------- НАСТРОЙКИ -----------------
-BOT_TOKEN = os.getenv("BOT_TOKEN")  # т.к. на хостинге задаём через Envs
-if not BOT_TOKEN:
-    raise RuntimeError(
-        "Переменная окружения BOT_TOKEN не задана. "
-        "Задай её в Render → Environment → Add Environment Variable."
-    )
+def run_keepalive():
+    port = int(os.getenv("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port)
 
-# Кнопки 2 сверху + 1 широкой снизу
-def main_menu():
+threading.Thread(target=run_keepalive, daemon=True).start()
+
+# ---------- ХЕЛПЕРЫ ----------
+def fmt_remaining(until: datetime) -> str:
+    now = datetime.utcnow()
+    if until <= now:
+        return "00:00"
+    left = until - now
+    m, s = divmod(int(left.total_seconds()), 60)
+    return f"{m:02d}:{s:02d}"
+
+def timer_active(chat_id: int) -> bool:
+    info = RUNNING.get(chat_id)
+    if not info:
+        return False
+    return info["until"] > datetime.utcnow()
+
+def clear_timer(chat_id: int):
+    RUNNING.pop(chat_id, None)
+
+def main_keyboard() -> InlineKeyboardMarkup:
+    # ряд 1: 10 и 20 минут, ряд 2: одна широкая 30
     kb = [
         [
-            InlineKeyboardButton("⏱ 10 минут", callback_data="start_10"),
-            InlineKeyboardButton("⏱ 20 минут", callback_data="start_20"),
+            InlineKeyboardButton("🕒 10 минут", callback_data="start_10"),
+            InlineKeyboardButton("🕓 20 минут", callback_data="start_20"),
         ],
-        [InlineKeyboardButton("⏱ 30 минут", callback_data="start_30")],
-        [InlineKeyboardButton("🛑 Стоп", callback_data="stop")],
+        [
+            InlineKeyboardButton("🕕 30 минут", callback_data="start_30"),
+        ],
+        [
+            InlineKeyboardButton("⛔ Стоп", callback_data="stop"),
+        ],
     ]
     return InlineKeyboardMarkup(kb)
 
-# Имя джоба по чату и юзеру
-def job_name(chat_id: int) -> str:
-    return f"chat_{chat_id}"
-
-# Сохранение id закреплённого сообщения, чтобы потом снять пин
-PIN_KEY = "pinned_msg_id"
-# Кто запустил таймер
-STARTER_KEY = "starter_id"
-# id сообщения с таймером, которое мы правим
-TIMER_MSG_KEY = "timer_msg_id"
-# осталось минут
-LEFT_MIN_KEY = "left_min"
-
-# ----------------- ХЕНДЛЕРЫ -----------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = "Выбери длительность. В конце пингую того, кто запустил❗️"
-    await update.message.reply_text(text, reply_markup=main_menu())
-
-async def stop_active_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, send_final: bool):
-    """Снять все регистрационные данные, остановить job, распинить, почистить"""
-    jq = context.application.job_queue
-    # стопим задачу
-    for j in list(jq.get_jobs_by_name(job_name(chat_id)) or []):
-        j.schedule_removal()
-
-    # распинить
-    data = context.chat_data
-    pinned_id = data.get(PIN_KEY)
-    if pinned_id:
+async def send_or_edit_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, msg_id: int | None) -> int:
+    if msg_id:
         try:
-            await context.bot.unpin_chat_message(chat_id, pinned_id)
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text, parse_mode=ParseMode.HTML
+            )
+            return msg_id
         except Exception:
             pass
-        data[PIN_KEY] = None
+    msg = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    return msg.message_id
 
-    # финальная надпись (опционально)
-    if send_final:
-        starter_id = data.get(STARTER_KEY)
-        if starter_id:
+# ---------- JOBS ----------
+async def tick(context: ContextTypes.DEFAULT_TYPE):
+    """Обновление сообщения каждую минуту."""
+    chat_id = context.job.chat_id
+    info = RUNNING.get(chat_id)
+    if not info:
+        return
+
+    if datetime.utcnow() >= info["until"]:
+        # Завершение
+        user_mention = info["owner_name"]
+        try:
             await context.bot.send_message(
                 chat_id,
-                f"Выплату окончил! <a href='tg://user?id={starter_id}'>‎</a>",
+                f"✅ <b>Выплату окончил!</b>\n{user_mention}",
                 parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
             )
+        except Exception as e:
+            log.warning("send finish msg: %s", e)
 
-    # чистим метки
-    for k in (STARTER_KEY, TIMER_MSG_KEY, LEFT_MIN_KEY):
-        context.chat_data[k] = None
+        # Снимаем пин
+        try:
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=info["pin_id"])
+        except Exception:
+            # иногда пин уже снят
+            pass
 
-async def pick_timer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Нажатие на любые кнопки"""
+        clear_timer(chat_id)
+        return
+
+    # Обновить текст таймера
+    remain = fmt_remaining(info["until"])
+    text = f"⏱ <b>Таймер</b>\nОсталось: <b>{remain}</b>\nЗапустил: {info['owner_name']}\n\nВыбери длительность. В конце пингую того, кто запустил❗️"
+    try:
+        new_id = await send_or_edit_timer(context, chat_id, text, info["msg_id"])
+        info["msg_id"] = new_id
+    except Exception as e:
+        log.warning("tick edit: %s", e)
+
+# ---------- HANDLERS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_chat.send_message(
+        "Привет! Я таймер-бот.\n\nВыбери длительность. В конце пингую того, кто запустил❗️",
+        reply_markup=main_keyboard()
+    )
+
+async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     chat_id = query.message.chat_id
-    data = query.data
+    user = query.from_user
+    mention = user.mention_html()
 
-    # нажатие "Стоп"
+    data = query.data or ""
+
     if data == "stop":
-        await stop_active_timer(context, chat_id, send_final=True)
-        # обновить кнопки
-        await query.edit_message_text(
-            "Выбери длительность. В конце пингую того, кто запустил❗️",
-            reply_markup=main_menu(),
-        )
-        return
+        info = RUNNING.get(chat_id)
+        if not info:
+            await query.edit_message_reply_markup(reply_markup=main_keyboard())
+            await context.bot.send_message(chat_id, "Таймер не запущен.")
+            return
 
-    # Проверяем, есть ли уже активный таймер
-    active = context.application.job_queue.get_jobs_by_name(job_name(chat_id))
-    if active:
-        await query.answer("Уже тикает таймер в этом чате. Сначала нажми «Стоп».", show_alert=True)
-        return
+        # Только владелец или админ группы (если надо — можно расширить) — но для простоты только владелец:
+        if info["owner_id"] != user.id:
+            await context.bot.send_message(chat_id, "Остановить может только тот, кто запускал.")
+            return
 
-    # Сколько минут
-    minutes_map = {"start_10": 10, "start_20": 20, "start_30": 30}
-    minutes = minutes_map.get(data, 0)
-    if minutes == 0:
-        return
-
-    # кто запустил
-    starter = query.from_user
-    context.chat_data[STARTER_KEY] = starter.id
-    context.chat_data[LEFT_MIN_KEY] = minutes
-
-    # Создаём/обновляем сообщение таймера
-    text = f"⏳ Осталось: <b>{minutes} мин</b>\nЗапустил: <a href='tg://user?id={starter.id}'>‎</a>"
-    if context.chat_data.get(TIMER_MSG_KEY):
         try:
-            await query.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu())
-            timer_msg_id = query.message.message_id
+            await context.bot.unpin_chat_message(chat_id=chat_id, message_id=info["pin_id"])
         except Exception:
-            # если не получилось отредактировать — отправим новое
-            m = await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu())
-            timer_msg_id = m.message_id
-    else:
-        m = await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=main_menu())
-        timer_msg_id = m.message_id
+            pass
 
-    context.chat_data[TIMER_MSG_KEY] = timer_msg_id
+        clear_timer(chat_id)
+        await context.bot.send_message(chat_id, f"✅ <b>Выплату окончил!</b>\n{mention}", parse_mode=ParseMode.HTML)
+        return
 
-    # Пин без уведомлений
+    # Старт
+    if timer_active(chat_id):
+        # уже идёт — не даём второй
+        await context.bot.send_message(chat_id, "⛔ Уже идёт таймер. Сначала останови текущий.")
+        return
+
+    minutes = 0
+    if data == "start_10":
+        minutes = 10
+    elif data == "start_20":
+        minutes = 20
+    elif data == "start_30":
+        minutes = 30
+
+    if minutes <= 0:
+        return
+
+    until = datetime.utcnow() + timedelta(minutes=minutes)
+
+    # первичное сообщение таймера
+    remain = fmt_remaining(until)
+    text = f"⏱ <b>Таймер</b>\nОсталось: <b>{remain}</b>\nЗапустил: {mention}\n\nВыбери длительность. В конце пингую того, кто запустил❗️"
+    timer_msg = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+
+    # пин без сервисного уведомления
+    pin_id = timer_msg.message_id
     try:
-        res = await context.bot.pin_chat_message(chat_id, timer_msg_id, disable_notification=True)
-        # pinChatMessage возвращает True. pinned_id у нас наш timer_msg_id
-        context.chat_data[PIN_KEY] = timer_msg_id
-    except Exception:
-        context.chat_data[PIN_KEY] = None
+        await context.bot.pin_chat_message(chat_id=chat_id, message_id=pin_id, disable_notification=True)
+    except Exception as e:
+        log.warning("pin failed: %s", e)
 
-    # старт job — раз в минуту обновляем
-    context.application.job_queue.run_repeating(
-        callback=every_minute_tick,
+    RUNNING[chat_id] = {
+        "owner_id": user.id,
+        "owner_name": mention,
+        "until": until,
+        "msg_id": timer_msg.message_id,
+        "pin_id": pin_id,
+    }
+
+    # поставить job — обновление каждую минуту
+    context.job_queue.run_repeating(
+        tick,
         interval=60,
         first=60,
-        name=job_name(chat_id),
-        data={"chat_id": chat_id},
+        chat_id=chat_id,
+        name=f"timer_{chat_id}",
     )
 
-async def every_minute_tick(context: ContextTypes.DEFAULT_TYPE):
-    """Ежеминутный тикер: уменьшаем минуты, обновляем сообщение, финиш"""
-    chat_id = context.job.data["chat_id"]
-
-    left = context.chat_data.get(LEFT_MIN_KEY) or 0
-    left = max(0, left - 1)
-    context.chat_data[LEFT_MIN_KEY] = left
-
-    # Обновим сообщение
-    timer_msg_id = context.chat_data.get(TIMER_MSG_KEY)
-    starter_id = context.chat_data.get(STARTER_KEY)
+    # кнопки под стартовым сообщением
     try:
-        if timer_msg_id:
-            if left > 0:
-                txt = f"⏳ Осталось: <b>{left} мин</b>\nЗапустил: <a href='tg://user?id={starter_id}'>‎</a>"
-                await context.bot.edit_message_text(
-                    txt, chat_id=chat_id, message_id=timer_msg_id,
-                    parse_mode=ParseMode.HTML, reply_markup=main_menu()
-                )
-            else:
-                # Финиш: распин, финальное сообщение, остановка джоба
-                await stop_active_timer(context, chat_id, send_final=True)
-    except Exception as e:
-        log.warning("Edit/pin/unpin failed: %s", e)
+        await timer_msg.edit_reply_markup(reply_markup=main_keyboard())
+    except Exception:
+        pass
 
-# ----------------- ТЕЛЕГРАМ-БОТ -----------------
-async def tg_main():
-    application = (
-        Application.builder()
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Команды:\n"
+        "/start — меню с кнопками\n"
+        "Кнопками запускаешь на 10/20/30 минут.\n"
+        "⛔ Стоп — останавливает текущий таймер (может только тот, кто запускал)."
+    )
+
+# ---------- MAIN ----------
+async def main():
+    application: Application = (
+        ApplicationBuilder()
         .token(BOT_TOKEN)
-        .arbitrary_callback_data(True)
         .build()
     )
 
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CallbackQueryHandler(pick_timer))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_cmd))
+    application.add_handler(CallbackQueryHandler(handle_buttons))
 
-    # Запуск long-polling
-    log.info("Starting Telegram polling…")
+    log.info("Bot starting...")
     await application.initialize()
     await application.start()
-    try:
-        await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        # Держим фоново бесконечно
-        await asyncio.Event().wait()
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
+    await application.updater.start_polling(allowed_updates=None)  # polling
+    await application.updater.wait()
+    await application.stop()
+    await application.shutdown()
 
-def _run_tg_in_thread():
-    """Запускаем Telegram-петлю в отдельном потоке,
-    чтобы Gunicorn держал HTTP-приложение (Flask), а бот работал параллельно."""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(tg_main())
-
-# Стартуем поток сразу при импорте модуля (важно для gunicorn)
-threading.Thread(target=_run_tg_in_thread, daemon=True).start()
-
-# ----------------- ЛОКАЛЬНЫЙ СТАРТ -----------------
 if __name__ == "__main__":
-    # Для локального теста:
-    # 1) python bot.py — запустит Flask на 8080 и бота в фоне
-    # 2) В боте отправь /start
-    port = int(os.getenv("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        log.info("Bot stopped")
